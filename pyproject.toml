@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "emergent-canonical-frame"
+version = "1.0.0"
+description = "Code for the paper Emergence of a Shared Canonical Object Frame from In-the-Wild Videos"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Tom Fischer" }
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "pillow",
+    "opencv-python-headless",
+    "hydra-core",
+    "omegaconf",
+    "tqdm",
+    "rich",
+    "einops",
+    "scikit-learn",
+    "h5py",
+    "pandas",
+    "plotly",
+    "huggingface-hub",
+    "fvcore",
+    "iopath",
+    "poselib",
+    "torch",
+    "torchvision",
+    "healpy",
+    "nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast.git",
+]
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = []
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

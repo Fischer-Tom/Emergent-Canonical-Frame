@@ -1,0 +1,22 @@
+defaults:
+    - dataset: uco3d
+    - model: default 
+    - optimizer: default
+    - training: default
+    - override hydra/hydra_logging: disabled
+    - override hydra/job_logging: disabled
+    - _self_
+
+experiment_name: "training"
+seed: 42
+
+logging:
+    run_root: runs
+    log: logs
+    checkpoints: checkpoints
+    log_interval: 100
+
+hydra:
+     output_subdir: config/hydra
+     run:
+         dir: ${logging.run_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
