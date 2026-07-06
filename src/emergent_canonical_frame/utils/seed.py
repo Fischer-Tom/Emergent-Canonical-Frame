@@ -2,7 +2,7 @@ import random
 import numpy as np
 import torch
 
-def _seed_everything(seed: int, rank: int) -> None:
+def seed_everything(seed: int, rank: int) -> None:
     seed = int(seed) + int(rank)
     random.seed(seed)
     np.random.seed(seed)

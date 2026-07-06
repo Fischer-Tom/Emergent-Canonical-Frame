@@ -1,0 +1,134 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Editable install metadata
+*.egg
+
+# IDE / editor
+.vscode/
+.idea/
+.zed/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+wandb/
+mlruns/
+tensorboard/
+lightning_logs/
+
+# Hydra outputs
+outputs/
+multirun/
+.hydra/
+
+# Training outputs
+checkpoints/
+ckpts/
+runs/
+experiments/
+results/
+artifacts/
+predictions/
+visualizations/
+debug_outputs/
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+
+# Datasets / large local data
+data/
+datasets/
+UCO3D/
+uco3d/
+arkit/
+ARKitScenes/
+Objectron/
+REAL275/
+Omni6DPose/
+Pascal3D+/
+ImageNet3D/
+
+# Third-party source checkouts
+thirdparty/
+external/
+
+# Temporary files
+tmp/
+temp/
+.cache/
+.cache_*/
+*.tmp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Slurm / cluster outputs
+slurm-*.out
+slurm-*.err
+*.out
+*.err
+
+# Apptainer / Singularity images
+*.sif
+*.sqsh
+*.img
+
+# Generated media
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.gif
+
+# Large arrays / intermediate artifacts
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.parquet
+
+# Keep directory placeholders
+!.gitkeep
