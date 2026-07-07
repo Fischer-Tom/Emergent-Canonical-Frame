@@ -76,7 +76,6 @@ debug_outputs/
 *.engine
 
 # Datasets / large local data
-data/
 datasets/
 UCO3D/
 uco3d/
