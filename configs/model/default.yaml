@@ -1,0 +1,12 @@
+backbone: "dinov3"
+remote_repo_dir: "/home/hpc/v114be/v114be20/dinov3"
+model: "dinov3_vitl16"
+remote_weights: "/hnvme/workspace/v114be20-dinov3/dinov3_vitl16"
+
+bottleneck_dim: 64
+output_size: [64, 64]
+lora:
+  use: true
+  r: 8
+  alpha: 8
+  dropout: 0.1
