@@ -1,12 +1,20 @@
-backbone: "dinov3"
-remote_repo_dir: "/home/hpc/v114be/v114be20/dinov3"
-model: "dinov3_vitl16"
-remote_weights: "/hnvme/workspace/v114be20-dinov3/dinov3_vitl16"
+_target_: emergent_canonical_frame.models.model.Model
 
-bottleneck_dim: 64
-output_size: [64, 64]
+backbone_name: dinov3_vitl16
+#repo_path: /home/hpc/v114be/v114be20/dinov3
+repo_path: /home/tom/Emergent-Canonical-Frame/thirdparty/dinov3
+weights_path: /hnvme/workspace/v114be20-dinov3/dinov3_vitl16
+
+d_model: 512
+d_desc: 512
+n_blocks: 6
+n_heads: 8
+dim_feedforward: 2048
+mesh_subdivisions: 14
+
 lora:
   use: true
   r: 8
   alpha: 8
   dropout: 0.1
+  targets: ["q", "v"]

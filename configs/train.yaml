@@ -20,7 +20,3 @@ hydra:
      output_subdir: config/hydra
      run:
          dir: ${logging.run_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
-
-representation:
-    pca_init: true
-    subdivisions: 14

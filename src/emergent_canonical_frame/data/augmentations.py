@@ -2,6 +2,7 @@ import math
 import torch
 from dataclasses import dataclass
 from typing import Tuple, List, Optional
+from omegaconf.dictconfig import DictConfig
 
 from torchvision.transforms import v2
 from torchvision.transforms import functional as TVF
@@ -40,9 +41,9 @@ class SampleTransformCfg:
 
  
 class SampleTransform:
-    def __init__(self, cfg: SampleTransformCfg, iteration_state: Optional[SharedIteration] = None):
+    def __init__(self, cfg: SampleTransformCfg, iteration_state: int = 0):
         self.cfg = cfg
-        self.iteration_state = iteration_state or SharedIteration(0)
+        self.iteration_state = iteration_state
 
         if cfg.training:
             self.color_jitter = v2.RandomApply(
@@ -59,13 +60,14 @@ class SampleTransform:
             self.occluder = None
 
     def set_iteration(self, iteration: int) -> None:
-        self.iteration_state.set(iteration)
+        self.iteration_state = iteration
+
 
     def _geometric_enabled(self) -> bool:
-        return self.cfg.training and self.iteration_state.get() >= self.cfg.geometric_start_iter
+        return self.cfg.training and self.iteration_state >= self.cfg.geometric_start_iter
 
     def _occlusion_enabled(self) -> bool:
-        return self.cfg.training and self.iteration_state.get() >= self.cfg.occlusion_start_iter
+        return self.cfg.training and self.iteration_state >= self.cfg.occlusion_start_iter
 
     @torch.no_grad()
     def __call__(self, sample: SequenceSample) -> SequenceSample:
@@ -324,3 +326,13 @@ def _adjust_cameras_for_crop_scale_pad(
     cams.principal_point = (half_new - pp_px) / rescale_new
     cams.image_size = torch.tensor([Ht, Wt], dtype=torch.float32, device=dev).repeat(N, 1)
 
+def transform_from_cfg(cfg: DictConfig, training: bool = True) -> SampleTransform:
+    aug = cfg.augmentation
+
+    tcfg = SampleTransformCfg(
+        size_hw=tuple(cfg.image_size),
+        training=training,
+        **aug,
+    )
+
+    return SampleTransform(tcfg)

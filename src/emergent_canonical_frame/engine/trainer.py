@@ -3,7 +3,7 @@ from pathlib import Path
 from hydra.core.hydra_config import HydraConfig
 from hydra.utils import instantiate, to_absolute_path
 
-from emergent_canonical_frame.data.loader import get_dataloader
+from emergent_canonical_frame.data.loader import build_loader
 from emergent_canonical_frame.utils import seed_everything
 from emergent_canonical_frame.utils.ddp_utils import (
     init_ddp,
@@ -22,7 +22,7 @@ def train(cfg):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
 
     dataset = instantiate(cfg.dataset, split="train")
-    dataloader = get_dataloader(dataset, cfg.batch_size, train=True, 
+    dataloader = build_loader(dataset, cfg.training, training=True,
         world_size=world_size, distributed=distributed, rank=rank)
 
     # Step 2: Initialize the model

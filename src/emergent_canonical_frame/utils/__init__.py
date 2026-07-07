@@ -1,1 +1,1 @@
-from seed import seed_everything
+from .seed import seed_everything

@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import DataLoader
 from typing import Optional, List
 
-from emergent_canonical_frame.data.augmentations import SampleTransform
+from emergent_canonical_frame.data.augmentations import SampleTransform, transform_from_cfg
 from emergent_canonical_frame.data.structures import SequenceSample, Batch, concat_cameras
 
 def safe_collate(samples: List[Optional[SequenceSample]]) -> Batch:

@@ -33,6 +33,7 @@ dependencies = [
     "iopath",
     "poselib",
     "torch",
+    "torchmetrics",
     "torchvision",
     "healpy",
 ]

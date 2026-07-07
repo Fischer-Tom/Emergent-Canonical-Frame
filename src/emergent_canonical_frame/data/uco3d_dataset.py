@@ -8,6 +8,7 @@ import random
 import warnings
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -26,10 +27,8 @@ from uco3d.dataset_utils.orm_types import (
 )
 from uco3d.dataset_utils.utils import LruCacheWithCleanup, get_dataset_root
 
-from utils.camera import Camera
+from .structures import Camera, FrameRecord, SequenceSample
 
-from .sampling import stratified_sample
-from .schema import FrameRecord, SequenceSample
 from .transforms import (
     MissingPointCloudError,
     align_frame,
@@ -42,24 +41,12 @@ logger = logging.getLogger(__name__)
 
 
 class UCO3DDataset(Dataset):
-    """Sequence-level UCO3D dataset.
-
-    Each ``__getitem__(i)`` returns a ``SequenceSample`` with K frames sampled
-    stratified-by-time from sequence ``i``. Image+mask are undistorted with
-    COLMAP coefficients, the camera is rewritten to rectified intrinsics, the
-    sequence similarity transform is applied, and (by default) the point cloud
-    bbox is used to center+scale the object.
-
-    Bad sequences (missing video frame / point cloud / etc.) return ``None``
-    when ``skip_bad=True``; use :func:`dataset.collate.safe_collate` to filter
-    them out. No recursive retry.
-    """
 
     def __init__(
         self,
+        data_root,
         split: str = "train",
         *,
-        data_root: Optional[str] = None,
         subset_lists_file: Optional[str] = None,
         categories: Optional[List[str]] = None,
         frames_per_sequence: int = 4,
@@ -77,7 +64,7 @@ class UCO3DDataset(Dataset):
         point_cloud_cache_size: int = 16,
         frame_orm_cache_size: int = 1024,
     ) -> None:
-        self.data_root = data_root or get_dataset_root(assert_exists=True)
+        self.data_root = data_root
         meta = os.path.join(self.data_root, "metadata.sqlite")
         if not os.path.exists(meta):
             raise FileNotFoundError(f"UCO3D metadata.sqlite not found at {meta}")
@@ -406,3 +393,33 @@ class UCO3DDataset(Dataset):
                 ).fetchall()
             pairs = [(str(s), int(f)) for s, f in rows]
         return pairs
+
+def stratified_sample(
+    num_frames: int, k: int, rng: random.Random, jitter: bool = True
+) -> List[int]:
+    """Pick k indices stratified across [0, num_frames) with optional jitter."""
+    if num_frames <= 0:
+        raise ValueError("num_frames must be > 0")
+    k = max(1, min(k, num_frames))
+    step = num_frames / k
+
+    idxs: List[int] = []
+    for i in range(k):
+        c = (i + 0.5) * step
+        if jitter:
+            lo = max(0, int(math.floor(c - 0.5 * step)))
+            hi = min(num_frames - 1, int(math.ceil(c + 0.5 * step)) - 1)
+            idxs.append(rng.randint(lo, max(lo, hi)))
+        else:
+            idxs.append(int(round(c)))
+
+    idxs = sorted({max(0, min(num_frames - 1, i)) for i in idxs})
+    while len(idxs) < k:
+        for j in range(num_frames):
+            if j not in idxs:
+                idxs.append(j)
+                idxs.sort()
+                break
+        else:
+            break
+    return idxs
