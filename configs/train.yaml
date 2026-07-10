@@ -14,13 +14,9 @@ logging:
     run_root: runs
     log: logs
     checkpoints: checkpoints
-    log_interval: 100
+    log_interval: 10
 
 hydra:
      output_subdir: config/hydra
      run:
          dir: ${logging.run_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
-
-representation:
-    pca_init: true
-    subdivisions: 14

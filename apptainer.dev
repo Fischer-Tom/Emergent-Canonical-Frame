@@ -1,0 +1,122 @@
+Bootstrap: docker
+From: nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
+
+
+%files
+    pyproject.toml /opt/ecf/pyproject.toml
+    README.md /opt/ecf/README.md
+    src /opt/ecf/src
+    configs /opt/ecf/configs
+    scripts /opt/ecf/scripts
+
+
+%environment
+    export UCO3D_DATASET_ROOT=${UCO3D_DATASET_ROOT:-/uco3d}
+    export PYTHONUNBUFFERED=1
+
+    export VIRTUAL_ENV=/opt/venv
+
+    export CUDA_HOME=/usr/local/cuda
+    export CUDA_PATH=/usr/local/cuda
+
+    export PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+
+
+%post
+    set -eux
+
+    export http_proxy=http://proxy.nhr.fau.de:80
+    export https_proxy=http://proxy.nhr.fau.de:80
+
+    mkdir -p /etc/apt/apt.conf.d
+    cat > /etc/apt/apt.conf.d/90proxy <<EOF
+Acquire::http::Proxy "http://proxy.nhr.fau.de:80";
+Acquire::https::Proxy "http://proxy.nhr.fau.de:80";
+Acquire::ForceIPv4 "true";
+Acquire::Retries "5";
+Acquire::Languages "none";
+EOF
+
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        python3-venv \
+        python3-dev \
+        git \
+        curl \
+        wget \
+        ca-certificates \
+        build-essential \
+        pkg-config \
+        ninja-build \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+        libpcre2-dev \
+        vim \
+        && rm -rf /var/lib/apt/lists/*
+
+    python3 -m venv /opt/venv
+
+    /opt/venv/bin/python -m pip install --upgrade \
+        pip \
+        setuptools \
+        wheel \
+        ninja
+
+    export CUDA_HOME=/usr/local/cuda
+    export CUDA_PATH=/usr/local/cuda
+    export PATH=/usr/local/cuda/bin:/opt/venv/bin:$PATH
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+
+    which nvcc
+    nvcc --version
+
+    cd /opt/ecf
+
+    # Installs this project and ordinary Python dependencies from pyproject.toml.
+    # Keep nvdiffrast and uco3d OUT of normal pyproject dependencies.
+    /opt/venv/bin/python -m pip install --no-cache-dir -e .
+
+    /opt/venv/bin/python - <<'PY'
+import torch
+
+print("torch:", torch.__version__)
+print("torch cuda:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+PY
+
+    mkdir -p /opt/thirdparty
+
+    # nvdiffrast must be installed after PyTorch and without build isolation.
+    export TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0"
+
+    cd /opt/thirdparty
+    GIT_TERMINAL_PROMPT=0 git clone https://github.com/NVlabs/nvdiffrast.git
+
+    cd /opt/thirdparty/nvdiffrast
+    /opt/venv/bin/python -m pip install --no-cache-dir --no-build-isolation .
+
+    # UCO3D is installed separately from source.
+    cd /opt/thirdparty
+    GIT_TERMINAL_PROMPT=0 git clone https://github.com/facebookresearch/uco3d.git
+
+    cd /opt/thirdparty/uco3d
+    /opt/venv/bin/python -m pip install --no-cache-dir -e .
+
+    /opt/venv/bin/python - <<'PY'
+import torch
+import nvdiffrast.torch as dr
+import emergent_canonical_frame
+
+print("install ok")
+print("torch:", torch.__version__)
+print("torch cuda:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+PY
+
+
+%runscript
+    exec /bin/bash "$@"

@@ -1,29 +1,16 @@
-"""Minimal forward-pass model: image -> per-object mesh vertex correspondences.
-
-Backbone (DINO + LoRA/adapter) -> MeshDecoder (mask-conditioned cross-attention,
-one query set per object instance) -> MeshCorrespondenceHead (per-vertex pixel
-similarity + mask logits). No criterion, rendering, or training-time losses —
-see models/model.py for the full training model.
-
-Every branch here is on static (trace-time) shapes, never on tensor values, so
-the forward pass compiles cleanly with `torch.compile`.
-"""
 
 import copy
 import math
 import os.path
-from typing import Optional
+from typing import Optional, Mapping, Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 from omegaconf import DictConfig
 from torch import Tensor, nn
 
-
-# ---------------------------------------------------------------------------
-# Backbone: DINO ViT + LoRA / bottleneck adapters for parameter-efficient tuning
-# ---------------------------------------------------------------------------
 class LoRAQKV(nn.Module):
     def __init__(self, qkv: nn.Linear, r=16, alpha=32, dropout=0.05, target=("q", "v")):
         super().__init__()
@@ -99,23 +86,17 @@ class MLPWithAdapter(nn.Module):
         return self.mlp(x) + self.adapter(x)
 
 
-def inject_adapters_and_lora_into_vit(
+def inject_lora_into_vit(
     vit,
     use_lora: bool,
-    use_adapter: bool,
     lora_r=8,
     lora_alpha=16,
     lora_dropout=0.05,
     lora_targets=("q", "v"),
-    adapter_bottleneck=64,
-    adapter_scale=0.1,
-    adapter_dropout=0.0,
-    target_blocks=None,
 ):
     vit.requires_grad_(False)
     blocks = vit.blocks
-    if target_blocks is None:
-        target_blocks = range(len(blocks))
+    target_blocks = range(len(blocks))
 
     for i in target_blocks:
         blk = blocks[i]
@@ -124,11 +105,6 @@ def inject_adapters_and_lora_into_vit(
             if not (hasattr(attn, "qkv") and isinstance(attn.qkv, nn.Linear)):
                 raise ValueError(f"Block {i}: attn.qkv is not a fused nn.Linear; need custom mapping.")
             attn.qkv = LoRAQKV(attn.qkv, r=lora_r, alpha=lora_alpha, dropout=lora_dropout, target=lora_targets)
-        if use_adapter:
-            dim = getattr(blk.norm1, "normalized_shape", (blk.norm1.weight.shape[0],))[0]
-            blk.mlp = MLPWithAdapter(
-                blk.mlp, dim=dim, bottleneck_dim=adapter_bottleneck, s=adapter_scale, p=adapter_dropout,
-            )
     return vit
 
 
@@ -235,47 +211,61 @@ class Feature2Pyramid(nn.Module):
 
 
 class DINO(nn.Module):
-    def __init__(self, out_ch: int, cfg: DictConfig, out_indices=(6, 14, 18, 23), adapt: bool = False):
+    def __init__(
+        self,
+        out_ch: int,
+        backbone_name: str = "dinov3_vitl16",
+        repo_path: str | None = None,
+        weights_path: str | None = None,
+        out_indices: tuple[int, int, int, int] = (6, 14, 18, 23),
+        lora: Mapping[str, Any] | None = None,
+    ):
         super().__init__()
-        weights_path = cfg.remote_weights if os.path.exists(cfg.remote_weights) else cfg.local_weights
-        repo_path = cfg.remote_repo_dir if os.path.exists(cfg.remote_repo_dir) else cfg.local_repo_dir
-        self.backbone = torch.hub.load(repo_path, cfg.model, source="local", pretrained=False)
-        self.backbone.load_state_dict(torch.load(weights_path))
 
-        self.finetune = cfg.get("finetune_backbone", False)
-        if not self.finetune:
-            for p in self.backbone.parameters():
-                p.requires_grad = False
+        lora = dict(lora or {})
+
+        self.backbone = torch.hub.load(
+            repo_path,
+            backbone_name,
+            source="local",
+            pretrained=False,
+        )
+        if os.path.exists(weights_path):
+            self.backbone.load_state_dict(torch.load(weights_path))
+            print(f"Loaded weights from {weights_path}")
+
+        for p in self.backbone.parameters():
+            p.requires_grad = False
 
         self.neck = Feature2Pyramid(embed_dim=self.backbone.embed_dim)
         self.decoder = UPerNetDecoderWithAux(
-            in_channels=[self.backbone.embed_dim] * 4, ppm_channels=out_ch, fpn_channels=out_ch,
+            in_channels=[self.backbone.embed_dim] * 4,
+            ppm_channels=out_ch,
+            fpn_channels=out_ch,
         )
+
         depth = len(self.backbone.blocks)
         req = list(out_indices)
-        self.out_indices = req if all(i < depth for i in req) else [round((k + 1) * depth / 4) - 1 for k in range(4)]
+        self.out_indices = (
+            req
+            if all(i < depth for i in req)
+            else [round((k + 1) * depth / 4) - 1 for k in range(4)]
+        )
 
-        self.adapt = adapt
-        self.use_lora = cfg.get("use_lora", False)
-        self.lora_frozen = False
-        if (self.use_lora or self.adapt) and not self.finetune:
-            inject_adapters_and_lora_into_vit(
+        self.use_lora = lora.get("use", True)
+
+        if self.use_lora:
+            inject_lora_into_vit(
                 self.backbone,
                 use_lora=self.use_lora,
-                use_adapter=self.adapt,
-                lora_r=cfg.lora_r,
-                lora_alpha=cfg.lora_alpha,
-                lora_dropout=cfg.lora_dropout,
-                lora_targets=("q", "v"),
-                adapter_bottleneck=cfg.bottleneck_dim,
-                adapter_scale=cfg.get("adapter_scale", 0.1),
-                adapter_dropout=cfg.get("adapter_dropout", 0.0),
-                target_blocks=cfg.get("adapt_target_blocks", None),
+                lora_r=int(lora.get("r", 8)),
+                lora_alpha=int(lora.get("alpha", 8)),
+                lora_dropout=float(lora.get("dropout", 0.1)),
+                lora_targets=tuple(lora.get("targets", ("q", "v"))),
             )
 
     def forward(self, x):
-        lora_active = self.use_lora and not self.lora_frozen
-        ctx = torch.enable_grad() if (self.finetune or self.adapt or lora_active) else torch.no_grad()
+        ctx = torch.enable_grad() if self.use_lora else torch.no_grad()
         with ctx:
             feat_maps = self.backbone.get_intermediate_layers(
                 x, n=self.out_indices, reshape=True, norm=True, return_class_token=False
@@ -292,11 +282,6 @@ class DINO(nn.Module):
                 _set_train_mode_for_trainable_modules(self.backbone, mode=mode)
 
 
-# ---------------------------------------------------------------------------
-# Mesh decoder: cross-attends mesh-vertex queries to image features, one query
-# set per object instance, restricted to that instance's pixels via an
-# attention mask (no pixel gathering/sampling — shapes stay static).
-# ---------------------------------------------------------------------------
 class PositionEmbeddingSine(nn.Module):
     def __init__(self, num_pos_feats=64, temperature=10000, normalize=True, scale=None):
         super().__init__()
@@ -318,7 +303,7 @@ class PositionEmbeddingSine(nn.Module):
             y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale
             x_embed = x_embed / (x_embed[:, :, -1:] + eps) * self.scale
 
-        dim_t = self.dim_t.to(device=device)
+        dim_t = self.dim_t.to(device=device, dtype=torch.float32)     
         pos_x = x_embed[:, :, :, None] / dim_t
         pos_y = y_embed[:, :, :, None] / dim_t
         pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
@@ -327,9 +312,17 @@ class PositionEmbeddingSine(nn.Module):
 
     def forward(self, x):
         B, _, H, W = x.shape
-        key = (H, W, x.device, x.dtype)
+    
+        if x.is_cuda and torch.is_autocast_enabled("cuda"):
+            target_dtype = torch.get_autocast_dtype("cuda")
+        else:
+            target_dtype = x.dtype
+    
+        key = (H, W, x.device, target_dtype)
+    
         if key not in self._cache:
-            self._cache[key] = self._build_grid(H, W, x.device, x.dtype)
+            self._cache[key] = self._build_grid(H, W, x.device, target_dtype)
+    
         return self._cache[key].expand(B, -1, -1, -1)
 
 
@@ -384,82 +377,58 @@ class TransformerDecoder(nn.Module):
 
 
 class MeshDecoder(nn.Module):
-    V: Tensor
 
-    def __init__(self, V, n_blocks=6, n_heads=8, d_model=512, dim_feedforward=2048):
+    def __init__(self, V, n_blocks=4, n_heads=8, d_model=256, dim_feedforward=512):
         super().__init__()
-        decoder_layer = TransformerDecoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=dim_feedforward)
-        self.decoder = TransformerDecoder(decoder_layer, num_layers=n_blocks, norm=nn.LayerNorm(d_model))
+        decoder_layer = TransformerDecoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=dim_feedforward
+        )
+        self.decoder = TransformerDecoder(
+            decoder_layer, num_layers=n_blocks, norm=nn.LayerNorm(d_model)
+        )
 
         self.register_buffer("V", V)
         self.querys_embed = nn.Embedding(V.shape[0], d_model)
         self.positional_embedding_verts = nn.Sequential(
-            nn.Linear(3, d_model), nn.ReLU(inplace=True), nn.Linear(d_model, d_model),
+            nn.Linear(3, d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, d_model),
         )
         self.pos_embed_2d = PositionEmbeddingSine(d_model // 2, normalize=True)
-        self.obj_cond_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, feats: Tensor, obj_masks: Optional[Tensor] = None):
-        """One mesh-vertex query set per object instance.
-
-        obj_masks: (B, N, H, W) or (B, H, W) per-instance silhouettes, used to
-        (a) condition each object's queries with a masked-pooled feature and
-        (b) restrict cross-attention to that instance's pixels. None means a
-        single (N=1) whole-image object.
-
-        Returns a list of N tensors, each (num_vertices, B, d_model).
-        """
+    def forward(self, feats):
         if feats.dim() != 4:
             raise ValueError(f"feats must be (B,C,H,W), got {feats.shape}")
-        B, C, H, W = feats.shape
-
-        if obj_masks is None:
-            obj_masks = feats.new_ones((B, 1, H, W))
-        else:
-            if obj_masks.dim() == 3:
-                obj_masks = obj_masks.unsqueeze(1)
-            if tuple(obj_masks.shape[-2:]) != (H, W):
-                obj_masks = F.interpolate(obj_masks.float(), size=(H, W), mode="nearest")
-            obj_masks = obj_masks.to(device=feats.device, dtype=feats.dtype)
-        N = obj_masks.shape[1]
 
         memory = feats.flatten(2).permute(2, 0, 1)  # (HW, B, C)
         pos = rearrange(self.pos_embed_2d(feats), "b c h w -> (h w) b c")
-        if N > 1:
-            memory = memory.repeat_interleave(N, dim=1)  # (HW, B*N, C)
-            pos = pos.repeat_interleave(N, dim=1)
 
-        mask_flat = obj_masks.flatten(2)  # (B, N, HW)
-        feats_flat = feats.flatten(2).permute(0, 2, 1)  # (B, HW, C)
-        obj_cond = torch.bmm(mask_flat, feats_flat) / mask_flat.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        obj_cond = self.obj_cond_proj(obj_cond).reshape(B * N, C)  # order: b*N + n
+        B = memory.shape[1]
+        query_content = self.querys_embed.weight.unsqueeze(1).repeat(1, B, 1)
+        vertex_pos = self.positional_embedding_verts(self.V).unsqueeze(1).repeat(1, B, 1)
 
-        query_content = self.querys_embed.weight.unsqueeze(1).repeat(1, B * N, 1) + obj_cond.unsqueeze(0)
-        vertex_pos = self.positional_embedding_verts(self.V).unsqueeze(1).repeat(1, B * N, 1)
-
-        # A fully-masked instance (empty silhouette) would leave a query with
-        # no valid key to attend to, which MultiheadAttention turns into NaN.
-        # Un-mask those rows unconditionally instead of branching on `.any()`
-        # (a data-dependent branch would force a host sync / graph break).
-        key_padding_mask = mask_flat.reshape(B * N, H * W) <= 0
-        all_masked = key_padding_mask.all(dim=1, keepdim=True)
-        key_padding_mask = key_padding_mask & ~all_masked
-
-        hs = self.decoder(
-            tgt=query_content, memory=memory, memory_key_padding_mask=key_padding_mask, pos=pos, query_pos=vertex_pos,
-        )  # (Q, B*N, D)
-
-        Q = hs.shape[0]
-        hs = hs.view(Q, B, N, -1)
-        return [hs[:, :, i, :] for i in range(N)]
+        return self.decoder(tgt=query_content, memory=memory, pos=pos, query_pos=vertex_pos)
 
 
-# ---------------------------------------------------------------------------
-# Correspondence head: per-vertex pixel similarity + a mask logit derived from
-# the same similarity (no separate dense mask conv head).
-# ---------------------------------------------------------------------------
+class MaskHead(nn.Module):
+    def __init__(self, d_model=256):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(d_model, d_model // 2, 3, padding=1),
+            nn.GroupNorm(16, d_model // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(d_model // 2, d_model // 4, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.GroupNorm(16, d_model // 4),
+            nn.Conv2d(d_model // 4, 1, 1),
+        )
+
+    def forward(self, feats):
+        return self.head(feats)
+
+
 class MeshCorrespondenceHead(nn.Module):
-    def __init__(self, d_model: int = 512, d_desc: int = 512, mask_topk: int = 8, mask_hidden: int = 32):
+    def __init__(self, d_model: int = 256, d_desc: int = 128):
         super().__init__()
         self.query_proj = nn.Linear(d_model, d_desc)
         self.feat_proj = nn.Sequential(
@@ -469,58 +438,136 @@ class MeshCorrespondenceHead(nn.Module):
             nn.GELU(),
             nn.Conv2d(d_desc, d_desc, 1),
         )
-        self.mask_topk = mask_topk
-        self.mask_head = nn.Sequential(nn.Linear(2, mask_hidden), nn.GELU(), nn.Linear(mask_hidden, 1))
 
     def forward(self, hs: Tensor, feats: Tensor):
         # hs: (num_queries, B, d_model)  feats: (B, d_model, H, W)
-        # returns sim: (B, Q, H*W), mask_logits: (B, 1, H, W)
-        q_desc = F.normalize(self.query_proj(hs.permute(1, 0, 2)), dim=-1)
+        q = hs.permute(1, 0, 2)
+        q_desc = self.query_proj(q)
 
         k_desc = self.feat_proj(feats)
         B, D, H, W = k_desc.shape
-        k_desc = F.normalize(k_desc.flatten(2).transpose(1, 2), dim=-1)
+        k_desc = k_desc.flatten(2).transpose(1, 2)
 
-        sim = torch.matmul(q_desc, k_desc.transpose(1, 2))  # (B, Q, H*W)
+        q_desc = F.normalize(q_desc, dim=-1)
+        k_desc = F.normalize(k_desc, dim=-1)
 
-        # Pixel is foreground if it matches some vertex well. Pooled top-k
-        # stats keep the mask head's param count independent of vertex count.
-        k = min(self.mask_topk, sim.shape[1])
-        topk_sim = sim.topk(k, dim=1).values  # (B, k, H*W)
-        stats = torch.stack([topk_sim[:, 0, :], topk_sim.mean(dim=1)], dim=-1)  # (B, H*W, 2)
-        mask_logits = self.mask_head(stats).squeeze(-1).view(B, 1, H, W)
-
-        return sim, mask_logits
+        return torch.matmul(q_desc, k_desc.transpose(1, 2))  # (B, Q, H*W)
 
 class Model(nn.Module):
     def __init__(
         self,
-        cfg,
-        V: Tensor,
+        repo_path: str | None = None,
+        backbone_name: str = "dinov3_vitl16",
+        weights_path: str | None = None,
+        output_size: tuple[int, int] = (64, 64),
+        lora: Mapping[str, Any] | None = None,
+        mesh_subdivisions: int = 8,
         d_model: int = 512,
         d_desc: int = 512,
         n_blocks: int = 6,
         n_heads: int = 8,
         dim_feedforward: int = 2048,
+        downsample_factor: int = 4,
     ):
         super().__init__()
-        self.backbone = DINO(d_model, cfg.model, adapt=cfg.model.get("adapt", True))
-        self.mesh_decoder = MeshDecoder(V, n_blocks=n_blocks, n_heads=n_heads, d_model=d_model, dim_feedforward=dim_feedforward)
-        self.correspondence_head = MeshCorrespondenceHead(d_model=d_model, d_desc=d_desc)
+        V, F = healpix_cube_mesh(subdivisions=mesh_subdivisions)
         self.register_buffer("V", V)
+        self.register_buffer("F", F)
 
-    def forward(self, img: Tensor, obj_masks: Optional[Tensor] = None):
-        """
-        img: (B, 3, H, W)
-        obj_masks: (B, N, H, W) or (B, H, W) per-instance silhouettes, or None for N=1.
-        Returns: feats, mesh_descriptors_list, logits_list, mask_logits_list — one
-        entry per object instance N.
-        """
+        self.backbone_name = backbone_name
+        self.output_size = tuple(output_size)
+        self.downsample_factor = downsample_factor
+        self.lora_cfg = dict(lora) if lora is not None else {}
+
+        self.backbone = DINO(
+            out_ch=d_model,
+            backbone_name=backbone_name,
+            repo_path=repo_path,
+            weights_path=weights_path,
+            lora=self.lora_cfg,
+        )
+
+        self.mesh_decoder = MeshDecoder(
+            V,
+            n_blocks=n_blocks,
+            n_heads=n_heads,
+            d_model=d_model,
+            dim_feedforward=dim_feedforward,
+        )
+
+        self.correspondence_head = MeshCorrespondenceHead(
+            d_model=d_model,
+            d_desc=d_desc,
+        )
+        self.mask_head = MaskHead(d_model=d_model)
+
+
+    def forward(self, img: Tensor):
         feats = self.backbone(img)
-        mesh_descriptors_list = self.mesh_decoder(feats, obj_masks)
-        logits_list, mask_logits_list = [], []
-        for md in mesh_descriptors_list:
-            logits, mask_logits = self.correspondence_head(md, feats)
-            logits_list.append(logits)
-            mask_logits_list.append(mask_logits)
-        return feats, mesh_descriptors_list, logits_list, mask_logits_list
+        mesh_descriptors = self.mesh_decoder(feats)
+        logits = self.correspondence_head(mesh_descriptors, feats)
+        mask_logits = self.mask_head(feats)
+        return logits, mask_logits
+
+def healpix_cube_mesh(subdivisions: int, round_decimals: int = 14):
+    n = subdivisions
+    u = np.linspace(0, 1, n)
+    v = np.linspace(0, 1, n)
+    uu, vv = np.meshgrid(u, v)
+    uu = uu - 0.5
+    vv = vv - 0.5
+
+    verts = []
+    vindex = {}
+
+    def vid_of(vertex):
+        key = tuple(np.round(vertex, round_decimals))
+        if key in vindex:
+            return vindex[key]
+        k = len(verts)
+        vindex[key] = k
+        verts.append(vertex)
+        return k
+
+    faces = []
+    face_defs = [
+        (2, +0.5, 0, 1),
+        (2, -0.5, 0, 1),
+        (1, +0.5, 0, 2),
+        (1, -0.5, 0, 2),
+        (0, +0.5, 1, 2),
+        (0, -0.5, 1, 2),
+    ]
+    for const_axis, const_val, u_axis, v_axis in face_defs:
+        face_vids = np.zeros((n, n), dtype=int)
+        for i in range(n):
+            for j in range(n):
+                vertex = np.zeros(3)
+                vertex[const_axis] = const_val
+                vertex[u_axis] = uu[i, j]
+                vertex[v_axis] = vv[i, j]
+                face_vids[i, j] = vid_of(vertex)
+
+        for i in range(n - 1):
+            for j in range(n - 1):
+                v00 = face_vids[i, j]
+                v01 = face_vids[i, j + 1]
+                v10 = face_vids[i + 1, j]
+                v11 = face_vids[i + 1, j + 1]
+                faces.append([v00, v10, v11])
+                faces.append([v00, v11, v01])
+
+    verts = np.asarray(verts, dtype=float)
+    faces = np.asarray(faces, dtype=int)
+
+    v0 = verts[faces[:, 1]] - verts[faces[:, 0]]
+    v1 = verts[faces[:, 2]] - verts[faces[:, 0]]
+    n = np.cross(v0, v1)
+    centroids = verts[faces].mean(axis=1)
+    inward = np.einsum("ij,ij->i", n, centroids) < 0
+    faces[inward] = faces[inward][:, [0, 2, 1]]
+
+    bbox = np.max(verts, axis=0) - np.min(verts, axis=0)
+    verts *= 1 / np.linalg.norm(bbox)
+
+    return torch.from_numpy(verts.astype(np.float32)), torch.from_numpy(faces.astype(np.float32))

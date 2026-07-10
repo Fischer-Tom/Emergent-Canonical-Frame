@@ -1,7 +1,7 @@
-_target_: dataset.uco3d_dataset.UCO3DDataset
+_target_: emergent_canonical_frame.data.uco3d_dataset.UCO3DDataset
 
 split: "train"
-data_root: ~
+data_root: "/uco3d"
 subset_lists_file: ~
 categories: ~
 frames_per_sequence: 4

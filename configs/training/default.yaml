@@ -1,20 +1,19 @@
-epochs: 150
-batch_size: 4
+epochs: 15
+batch_size: 6
 num_workers: 16
 image_size: [256, 256]
-use_torch_compile: false
+use_torch_compile: true
 
 resume_from: ~
 resume_from_iteration: ~
 resume_model_only: false
 checkpoint_interval: 2000
 keep_interval_checkpoints: false
-use_mixed_precision: true
+mixed_precision: true
 
 augmentation:
     crop_to_mask: true
-    crop_padding: 0.1
-    crop_padding_range: [0.1, 0.25]
+    crop_padding: [0.1, 0.25]
     geometric_start_iter: 7500
     recrop_p: 0.7
     recrop_scale: [0.9, 1.0]
@@ -27,8 +26,7 @@ augmentation:
     rotate_p: 0.3
     rotate_deg: 30.0
     blur_p: 0.4
-    jitter:
-        brightness: 0.4
-        contrast: 0.4
-        saturation: 0.2
-        hue: 0.1
+    jitter_brightness: 0.4
+    jitter_contrast: 0.4
+    jitter_saturation: 0.2
+    jitter_hue: 0.1

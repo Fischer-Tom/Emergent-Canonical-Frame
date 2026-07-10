@@ -108,7 +108,7 @@ class Renderer:
             )
 
         scales = torch.linalg.norm(sizes, dim=-1)
-        V_render = self.V_obj[None, ...].repeat_interleave(seq_lengths, dim=0)
+        V_render = self.V_obj[None, ...].expand(len(seq_lengths), -1, -1).repeat_interleave(seq_lengths, dim=0)
 
         Rc = torch.bmm(centers[:, None, :], cameras.R).squeeze(1)
         if rescale_T:

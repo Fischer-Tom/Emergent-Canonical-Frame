@@ -1,5 +1,7 @@
 import hydra
 from omegaconf import DictConfig
+import torch
+
 
 from emergent_canonical_frame.engine.trainer import train
 
@@ -10,6 +12,8 @@ from emergent_canonical_frame.engine.trainer import train
     config_name="train",
 )
 def main(cfg: DictConfig) -> None:
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
     train(cfg)
 
 
