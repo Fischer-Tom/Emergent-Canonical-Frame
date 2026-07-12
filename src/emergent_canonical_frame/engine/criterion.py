@@ -89,6 +89,7 @@ class Criterion(nn.Module):
             "loss_mask": loss_mask,
             "loss_total": loss_kd + self.mask_loss_weight * loss_mask,
             "alignment_angle": alignment.alignment_angle.detach(),
+            "ransac_inlier_ratio": alignment.ransac_inlier_ratio.detach(),
         }
 
     def forward(

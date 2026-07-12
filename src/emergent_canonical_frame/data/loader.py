@@ -2,7 +2,11 @@ import torch
 from torch.utils.data import DataLoader
 from typing import Optional, List
 
-from emergent_canonical_frame.data.augmentations import SampleTransform, transform_from_cfg
+from emergent_canonical_frame.data.augmentations import (
+    SampleTransform,
+    SharedIteration,
+    transform_from_cfg,
+)
 from emergent_canonical_frame.data.structures import SequenceSample, Batch, concat_cameras
 
 def safe_collate(samples: List[Optional[SequenceSample]]) -> Batch:
@@ -55,13 +59,21 @@ class TransformedDataset(torch.utils.data.Dataset):
     def __init__(self, base, transform: SampleTransform):
         self.base = base
         self.transform = transform
+        self.epoch_state = SharedIteration(int(getattr(base, "epoch", 0)))
 
     def __len__(self):
         return len(self.base)
 
     def __getitem__(self, idx) -> Optional[SequenceSample]:
+        epoch = self.epoch_state.get()
+        base_epoch = getattr(self.base, "epoch", None)
+        if hasattr(self.base, "set_epoch") and base_epoch != epoch:
+            self.base.set_epoch(epoch)
         sample = self.base[idx]
         return None if sample is None else self.transform(sample)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch_state.set(epoch)
 
     def set_iteration(self, iteration: int) -> None:
         self.transform.set_iteration(iteration)
@@ -94,7 +106,7 @@ def build_loader(
         sampler=sampler,
         num_workers=cfg.num_workers,
         pin_memory=True,
-        persistent_workers=cfg.num_workers > 0,
+        persistent_workers=training and cfg.num_workers > 0,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
         collate_fn=safe_collate,
     )

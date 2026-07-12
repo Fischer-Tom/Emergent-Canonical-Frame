@@ -1,5 +1,7 @@
 name: AdamW
 lr_start: 1e-4
 lr_min: 1e-5
+lora_lr_start: 1e-5
+lora_lr_min: 1e-5
 weight_decay: 0.05
 clip_grad_norm: 1.0

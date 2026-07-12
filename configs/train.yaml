@@ -14,6 +14,7 @@ logging:
     run_root: runs
     log: logs
     checkpoints: checkpoints
+    visualizations: visualizations
     log_interval: 10
 
 hydra:

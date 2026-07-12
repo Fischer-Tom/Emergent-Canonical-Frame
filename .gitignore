@@ -131,3 +131,4 @@ slurm-*.err
 
 # Keep directory placeholders
 !.gitkeep
+eval_logs/

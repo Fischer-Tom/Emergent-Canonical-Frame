@@ -1,5 +1,6 @@
 import logging
 import sys
+import time
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -10,10 +11,13 @@ class Logger:
         self,
         rank: int = 0,
         name: str = "emergent_canonical_frame",
-        window: int = 20,
+        window: int = 100,
         log_file: Path | str | None = None,
+        total_iters: int | None = None,
     ):
         self.rank = rank
+        self.total_iters = total_iters
+        self.start_time = time.time()
         self._logger = logging.getLogger(name)
         if rank == 0 and not self._logger.handlers:
             fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
@@ -35,11 +39,21 @@ class Logger:
     def error(self, msg):
         self._logger.error(msg)
 
-    def log_dict(self, d: dict, step: int = -1):
-        prefix = f"[iter {step}] " if step >= 0 else ""
+    def log_dict(self, d: dict, step: int = -1, *, emit: bool = True):
         for k, v in d.items():
             val = v.item() if hasattr(v, "item") else v
-            hist = self._history[k]
-            hist.append(val)
-            smoothed = sum(hist) / len(hist)
-            self._logger.info(f"{prefix}{k}: {smoothed:.4f}")
+            self._history[k].append(float(val))
+
+        if not emit:
+            return
+
+        elapsed = time.time() - self.start_time
+        total = self.total_iters if self.total_iters is not None else "?"
+        speed = step / elapsed if step >= 0 and elapsed > 0 else 0.0
+        lines = [
+            f"Training Summary - Iteration {step}/{total}",
+            f"Elapsed: {elapsed / 3600:.2f}h | Speed: {speed:.2f} iter/s",
+        ]
+        for key, hist in self._history.items():
+            lines.append(f"{key}: {sum(hist) / len(hist):.4g}")
+        self._logger.info("\n" + "\n".join(lines))

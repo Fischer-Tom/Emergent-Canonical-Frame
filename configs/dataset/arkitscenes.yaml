@@ -1,0 +1,7 @@
+_target_: emergent_canonical_frame.data.eval_datasets.AbsOriBench
+
+split: "arkitscenes"
+data_root: "/path/to/abs_orientation_benchmark"
+cate: ~
+cad_root: "/path/to/imagenet3d/CAD"
+fallback_mesh_root: "/path/to/fallback_meshes"

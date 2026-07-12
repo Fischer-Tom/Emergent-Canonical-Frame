@@ -20,16 +20,10 @@ class Optimizer:
     def zero_grad(self):
         self.optimizer.zero_grad(set_to_none=True)
 
-    def step(self, scaler: torch.amp.GradScaler | None = None):
-        if scaler is not None and scaler.is_enabled():
-            scaler.unscale_(self.optimizer)
+    def step(self):
         if self.clip_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(self._params, self.clip_grad_norm)
-        if scaler is not None:
-            scaler.step(self.optimizer)
-            scaler.update()
-        else:
-            self.optimizer.step()
+        self.optimizer.step()
         self.scheduler.step()
 
     @property

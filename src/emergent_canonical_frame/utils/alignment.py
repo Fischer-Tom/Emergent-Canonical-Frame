@@ -8,6 +8,12 @@ from einops import einsum
 from torch import nn
 
 
+_RANSAC_WAHBA_ITERS = 100
+_RANSAC_WAHBA_SAMPLE_SIZE = 4
+_RANSAC_WAHBA_INLIER_COS = math.cos(math.radians(25.0))
+_RANSAC_WAHBA_EPS = 1e-6
+
+
 @dataclass
 class AlignmentResult:
     R_frame: torch.Tensor  # (B, 3, 3)
@@ -19,6 +25,7 @@ class AlignmentResult:
     valid_mask: torch.Tensor  # (B, H, W)
     sched: dict
     alignment_angle: torch.Tensor
+    ransac_inlier_ratio: torch.Tensor
     G: int
 
 
@@ -73,6 +80,7 @@ def invdist_weights(p: torch.Tensor, nbrs: torch.Tensor, eps: float = 1e-6):
     return inv / inv.sum(dim=-1, keepdim=True)
 
 
+@torch.no_grad()
 def wahba_batched(H: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
     """Row-convention Procrustes: R = V @ diag(corr) @ U.T, batched over dim 0 of H.
 
@@ -97,6 +105,130 @@ def wahba_batched(H: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
     return Rf.to(original_dtype)
 
 
+@torch.no_grad()
+def _wahba_matrix_from_points(
+    v: torch.Tensor,
+    v_match: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    outer = torch.einsum("ni,nj->nij", v, v_match)
+    return (weights[:, None, None] * outer).sum(dim=0)
+
+
+@torch.no_grad()
+def wahba_ransac_dense(
+    v: torch.Tensor,
+    v_match: torch.Tensor,
+    weights: torch.Tensor,
+    obj_id: torch.Tensor,
+    G: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Robust per-object Wahba over dense grids.
+
+    The model and loss remain dense. Only the no-grad teacher estimator gathers
+    the valid pixels belonging to each object, matching the original RANSAC
+    semantics: 100 weighted four-point hypotheses followed by an inlier refit.
+    """
+    device = v.device
+    if G == 0:
+        return (
+            torch.empty((0, 3, 3), device=device, dtype=torch.float32),
+            torch.tensor(0.0, device=device),
+        )
+
+    R_out = torch.eye(3, device=device, dtype=torch.float32).expand(G, 3, 3).clone()
+    inlier_ratio = torch.zeros(G, device=device, dtype=torch.float32)
+    has_inlier_metric = torch.zeros(G, device=device, dtype=torch.bool)
+
+    for g in range(G):
+        frame_mask = obj_id == g
+        if not bool(frame_mask.any()):
+            continue
+
+        vg = v[frame_mask].reshape(-1, 3).float()
+        mg = v_match[frame_mask].reshape(-1, 3).float()
+        wg = weights[frame_mask].reshape(-1).float().clamp_min(0.0)
+
+        valid_global = wg.sum() > _RANSAC_WAHBA_EPS
+        H_global = _wahba_matrix_from_points(vg, mg, wg).unsqueeze(0)
+        R_global = wahba_batched(
+            H_global,
+            valid_mask=valid_global.view(1),
+        )[0].float()
+
+        positive = wg > _RANSAC_WAHBA_EPS
+        n_positive = int(positive.sum().item())
+        if n_positive == 0:
+            R_out[g] = R_global
+            continue
+
+        vp = vg[positive]
+        mp = mg[positive]
+        wp = wg[positive]
+        R_final = R_global
+
+        if n_positive >= _RANSAC_WAHBA_SAMPLE_SIZE:
+            probability = wp / wp.sum().clamp_min(_RANSAC_WAHBA_EPS)
+            sample_idx = torch.stack(
+                [
+                    torch.multinomial(
+                        probability,
+                        _RANSAC_WAHBA_SAMPLE_SIZE,
+                        replacement=False,
+                    )
+                    for _ in range(_RANSAC_WAHBA_ITERS)
+                ],
+                dim=0,
+            )
+            vs = vp[sample_idx]
+            ms = mp[sample_idx]
+            ws = wp[sample_idx]
+            H_samples = (
+                ws[:, :, None, None] * torch.einsum("ksi,ksj->ksij", vs, ms)
+            ).sum(dim=1)
+            R_candidates = wahba_batched(
+                H_samples,
+                valid_mask=ws.sum(dim=1) > _RANSAC_WAHBA_EPS,
+            ).float()
+
+            pred = torch.matmul(vp.unsqueeze(0), R_candidates.transpose(-1, -2))
+            cos = (pred * mp.unsqueeze(0)).sum(dim=-1).clamp(-1.0, 1.0)
+            inliers = cos >= _RANSAC_WAHBA_INLIER_COS
+            consensus = (inliers.float() * wp.unsqueeze(0)).sum(dim=1)
+            mean_cos = (cos * wp.unsqueeze(0)).sum(dim=1) / wp.sum().clamp_min(
+                _RANSAC_WAHBA_EPS
+            )
+            best = (consensus + 1e-3 * mean_cos).argmax()
+            best_inliers = inliers[best]
+
+            if int(best_inliers.sum().item()) >= _RANSAC_WAHBA_SAMPLE_SIZE:
+                H_inlier = _wahba_matrix_from_points(
+                    vp[best_inliers],
+                    mp[best_inliers],
+                    wp[best_inliers],
+                ).unsqueeze(0)
+                R_final = wahba_batched(
+                    H_inlier,
+                    valid_mask=torch.ones(1, device=device, dtype=torch.bool),
+                )[0].float()
+
+        R_out[g] = R_final
+        pred_final = vp @ R_final.transpose(0, 1)
+        final_inliers = (pred_final * mp).sum(dim=-1).clamp(
+            -1.0, 1.0
+        ) >= _RANSAC_WAHBA_INLIER_COS
+        inlier_ratio[g] = (final_inliers.float() * wp).sum() / wp.sum().clamp_min(
+            _RANSAC_WAHBA_EPS
+        )
+        has_inlier_metric[g] = True
+
+    if bool(has_inlier_metric.any()):
+        mean_inlier_ratio = inlier_ratio[has_inlier_metric].mean()
+    else:
+        mean_inlier_ratio = torch.tensor(0.0, device=device)
+    return R_out, mean_inlier_ratio
+
+
 class CanonicalAligner(nn.Module):
     """Aligns dense per-pixel mesh-vertex predictions to a per-object canonical
     rotation via weighted Wahba/Procrustes.
@@ -106,9 +238,10 @@ class CanonicalAligner(nn.Module):
     op is friendly to torch.compile.
     """
 
-    def __init__(self, total_iters: int = None):
+    def __init__(self, total_iters: int = None, use_ransac: bool = True):
         super().__init__()
         self.total_iters = total_iters
+        self.use_ransac = bool(use_ransac)
         self.c_iter = 0
 
     def forward(
@@ -124,42 +257,63 @@ class CanonicalAligner(nn.Module):
         assert self.total_iters is not None
         sched = build_schedule(self.c_iter, self.total_iters)
 
-        Vn = l2_normalize(V, dim=1)
-        Un = Vn.to(dtype=logits.dtype, device=device)
-        v = l2_normalize(v_grid.to(device=device, dtype=logits.dtype), dim=-1)
+        temperature = float(sched["T_f"])
+        # Preserve the model dtype and gradient path used by the dense loss.
+        Lf_student = logits / temperature
 
-        Lf_student = logits / float(sched["T_f"])
-        p_student = torch.softmax(Lf_student, dim=1)
-        v_match = l2_normalize(torch.einsum("bmhw,mc->bhwc", p_student, Un), dim=-1)
+        # Teacher alignment is no-grad and explicitly FP32. In particular,
+        # normalized entropy close to one must not be quantized to exactly one
+        # by BF16 before the confidence weight is squared.
+        with (
+            torch.no_grad(),
+            torch.amp.autocast(device_type=device.type, enabled=False),
+        ):
+            Vn = l2_normalize(V.float(), dim=1)
+            v = l2_normalize(v_grid.to(device=device).float(), dim=-1)
+            Lf_alignment = logits.float() / temperature
+            p_student = torch.softmax(Lf_alignment, dim=1)
+            v_match = l2_normalize(
+                torch.einsum("bmhw,mc->bhwc", p_student, Vn), dim=-1
+            )
 
-        M = logits.shape[1]
-        eps = 1e-8
-        logp = torch.log(p_student.clamp_min(eps))
-        Hn = -(p_student * logp).sum(dim=1)
-        Hn_norm = Hn / math.log(M)
-        gamma = 2.0
-        valid = valid_mask.to(logits.dtype)
-        w = (1.0 - Hn_norm).clamp(0.0, 1.0).pow(gamma) * valid
+            M = logits.shape[1]
+            logp = torch.log(p_student.clamp_min(1e-8))
+            Hn = -(p_student * logp).sum(dim=1)
+            Hn_norm = Hn / math.log(M)
+            valid = valid_mask.to(dtype=torch.float32)
+            w = (1.0 - Hn_norm).clamp(0.0, 1.0).pow(2.0) * valid
 
         obj_id = obj_id.to(torch.long)
         G = n_objects if n_objects is not None else int(obj_id.max().item()) + 1
 
-        with torch.amp.autocast(device_type="cuda", enabled=False):
-            v_f32 = v.float()
-            v_match_f32 = v_match.float()
-            w_f32 = w.float()
+        if self.use_ransac:
+            R_obj, ransac_inlier_ratio = wahba_ransac_dense(
+                v,
+                v_match,
+                w,
+                obj_id,
+                G,
+            )
+        else:
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                v_f32 = v.float()
+                v_match_f32 = v_match.float()
+                w_f32 = w.float()
 
-            H_frame = torch.einsum("bhwi,bhwj,bhw->bij", v_f32, v_match_f32, w_f32)
-            weight_frame = w_f32.sum(dim=(1, 2))
+                H_frame = torch.einsum(
+                    "bhwi,bhwj,bhw->bij", v_f32, v_match_f32, w_f32
+                )
+                weight_frame = w_f32.sum(dim=(1, 2))
 
-            H_obj = torch.zeros(G, 3, 3, device=device, dtype=torch.float32)
-            H_obj.index_add_(0, obj_id, H_frame)
-            weight_obj = torch.zeros(G, device=device, dtype=torch.float32)
-            weight_obj.index_add_(0, obj_id, weight_frame)
+                H_obj = torch.zeros(G, 3, 3, device=device, dtype=torch.float32)
+                H_obj.index_add_(0, obj_id, H_frame)
+                weight_obj = torch.zeros(G, device=device, dtype=torch.float32)
+                weight_obj.index_add_(0, obj_id, weight_frame)
 
-            R_obj = wahba_batched(H_obj, valid_mask=weight_obj > 1e-6)
+                R_obj = wahba_batched(H_obj, valid_mask=weight_obj > 1e-6)
+            ransac_inlier_ratio = torch.tensor(0.0, device=device)
 
-        R_frame = R_obj.to(dtype=logits.dtype)[obj_id]
+        R_frame = R_obj.float()[obj_id]
         Rv = torch.einsum("bhwi,bji->bhwj", v, R_frame)
 
         with torch.no_grad():
@@ -168,7 +322,7 @@ class CanonicalAligner(nn.Module):
 
         return AlignmentResult(
             R_frame=R_frame,
-            R_obj=R_obj.to(dtype=logits.dtype),
+            R_obj=R_obj.float(),
             obj_id=obj_id,
             v=v,
             Rv=Rv,
@@ -176,6 +330,7 @@ class CanonicalAligner(nn.Module):
             valid_mask=valid_mask,
             sched=sched,
             alignment_angle=alignment_angle.detach(),
+            ransac_inlier_ratio=ransac_inlier_ratio.detach(),
             G=G,
         )
 

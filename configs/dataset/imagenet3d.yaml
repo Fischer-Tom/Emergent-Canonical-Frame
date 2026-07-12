@@ -1,0 +1,5 @@
+_target_: emergent_canonical_frame.data.eval_datasets.ImageNet3D
+
+split: "val"
+data_root: "/uco3d/imagenet3d/imagenet3d_v1"
+cate: ~

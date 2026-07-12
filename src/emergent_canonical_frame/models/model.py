@@ -252,7 +252,9 @@ class DINO(nn.Module):
             else [round((k + 1) * depth / 4) - 1 for k in range(4)]
         )
 
+        self.finetune = False
         self.use_lora = lora.get("use", True)
+        self.lora_frozen = False
 
         if self.use_lora:
             inject_lora_into_vit(
@@ -265,8 +267,12 @@ class DINO(nn.Module):
             )
 
     def forward(self, x):
-        ctx = torch.enable_grad() if self.use_lora else torch.no_grad()
-        with ctx:
+        lora_active = self.use_lora and not self.lora_frozen
+        requires_backbone_grad = self.training and lora_active
+        context = (
+            torch.enable_grad() if requires_backbone_grad else torch.no_grad()
+        )
+        with context:
             feat_maps = self.backbone.get_intermediate_layers(
                 x, n=self.out_indices, reshape=True, norm=True, return_class_token=False
             )
@@ -359,7 +365,7 @@ class TransformerDecoderLayer(nn.Module):
         )[0]
         tgt = self.norm2(tgt + self.dropout2(tgt2))
 
-        tgt2 = self.linear2(self.dropout(F.gelu(self.linear1(tgt))))
+        tgt2 = self.linear2(self.dropout(F.relu(self.linear1(tgt))))
         return self.norm3(tgt + self.dropout3(tgt2))
 
 
@@ -508,6 +514,87 @@ class Model(nn.Module):
         logits = self.correspondence_head(mesh_descriptors, feats)
         mask_logits = self.mask_head(feats)
         return logits, mask_logits
+
+    @torch.no_grad()
+    def infer(
+        self,
+        batch,
+        annotations=None,
+        *,
+        use_gt_mask: bool = False,
+    ) -> dict:
+        """Return sparse pixel-to-canonical-vertex matches for pose fitting."""
+        annotations = annotations if annotations is not None else batch.annotations
+        if annotations is None:
+            raise ValueError("Model.infer requires rendered annotations")
+
+        logits, mask_logits = self(batch.image_rgb)
+        B, _M, HW = logits.shape
+        H, W = mask_logits.shape[-2:]
+        if H * W != HW:
+            raise ValueError(
+                f"Correspondence logits have {HW} pixels, mask has {H}x{W}"
+            )
+
+        vertex_idx = logits.argmax(dim=1)
+        matched_vertices = self.V[vertex_idx].view(B, H, W, 3)
+
+        if batch.valid_masks is None:
+            valid_region = torch.ones(
+                (B, H, W), device=logits.device, dtype=torch.bool
+            )
+        else:
+            valid_region = F.interpolate(
+                batch.valid_masks.float(),
+                size=(H, W),
+                mode="nearest",
+            ).squeeze(1).bool()
+
+        if use_gt_mask:
+            gt_mask = annotations.proxy_mask
+            if tuple(gt_mask.shape[-2:]) != (H, W):
+                gt_mask = F.interpolate(
+                    gt_mask.float().unsqueeze(1),
+                    size=(H, W),
+                    mode="nearest",
+                ).squeeze(1).bool()
+            pred_mask = gt_mask.bool() & valid_region
+        else:
+            pred_mask = (
+                torch.sigmoid(mask_logits).squeeze(1) > 0.5
+            ) & valid_region
+
+        selected = pred_mask.nonzero(as_tuple=False)
+        if selected.numel() == 0:
+            b_sel = torch.empty(0, device=logits.device, dtype=torch.long)
+            yx_sel = torch.empty(
+                (0, 2), device=logits.device, dtype=torch.long
+            )
+            m_v3d = torch.empty(
+                (0, 3), device=logits.device, dtype=self.V.dtype
+            )
+        else:
+            b_sel = selected[:, 0]
+            yx_sel = selected[:, 1:3]
+            m_v3d = matched_vertices[
+                selected[:, 0], selected[:, 1], selected[:, 2]
+            ]
+
+        return {
+            "m_v3d": m_v3d,
+            "match_dict": {
+                "matches": m_v3d,
+                "b_sel": b_sel,
+                "yx_sel": yx_sel,
+            },
+            "mask": pred_mask.float(),
+            "pred_mask": pred_mask.float(),
+            "b_sel": b_sel,
+            "yx_sel": yx_sel,
+            "logits": logits,
+            "mask_logits": mask_logits,
+            "feat_hw": (H, W),
+        }
 
 def healpix_cube_mesh(subdivisions: int, round_decimals: int = 14):
     n = subdivisions

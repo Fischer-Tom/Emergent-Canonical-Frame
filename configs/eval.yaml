@@ -1,0 +1,33 @@
+defaults:
+    - dataset: imagenet3d
+    - model: default
+    - optim: default
+    - training: default
+    - override hydra/hydra_logging: disabled
+    - override hydra/job_logging: disabled
+    - _self_
+
+experiment_name: "evaluation"
+seed: 42
+
+evaluation:
+    checkpoint: "/opt/ecf/runs/training/2026-07-11_23-18-02/checkpoints/latest.pt"
+    datasets: ["imagenet3d"]
+    split: "val"
+    output_root: "eval_logs"
+    symmetries_csv: "/uco3d/imagenet3d/imagenet3d_v1/ucf_symmetry_labels.csv"
+    seed: ${seed}
+    device: "cuda"
+    use_gt_mask: false
+    num_workers: ~
+
+logging:
+    run_root: runs
+    log: logs
+    checkpoints: checkpoints
+    log_interval: 100
+
+hydra:
+    output_subdir: config/hydra
+    run:
+        dir: ${evaluation.output_root}/hydra/${now:%Y-%m-%d_%H-%M-%S}

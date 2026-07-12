@@ -46,6 +46,7 @@ class SampleTransformCfg:
     patch_mask_size: Tuple[float, float] = (0.05, 0.30)
 
     blur_p: float = 0.4
+    grayscale_p: float = 0.2
     jitter_brightness: float = 0.4
     jitter_contrast: float = 0.4
     jitter_saturation: float = 0.2
@@ -61,9 +62,21 @@ class SampleTransform:
         self.iteration_state = iteration_state or SharedIteration(0)
 
         if cfg.training:
-            self.color_jitter = v2.RandomApply(
-                [v2.ColorJitter(cfg.jitter_brightness, cfg.jitter_contrast, cfg.jitter_saturation, cfg.jitter_hue)],
-                p=0.8,
+            self.color_jitter = v2.Compose(
+                [
+                    v2.RandomApply(
+                        [
+                            v2.ColorJitter(
+                                cfg.jitter_brightness,
+                                cfg.jitter_contrast,
+                                cfg.jitter_saturation,
+                                cfg.jitter_hue,
+                            )
+                        ],
+                        p=0.8,
+                    ),
+                    v2.RandomGrayscale(p=cfg.grayscale_p),
+                ]
             )
             self.blur = v2.RandomApply([v2.GaussianBlur(kernel_size=9, sigma=(0.1, 1.0))], p=cfg.blur_p)
             self.occluder = RandomPatchOcclusion(
@@ -123,12 +136,14 @@ class SampleTransform:
 
             pre_sz = torch.tensor(frame.shape[-2:], dtype=torch.float32)
 
-            frame_4d, s, cam_off, (vH, vW) = _scale_to_fit_and_blur_pad(frame.unsqueeze(0), Ht, Wt)
+            frame_4d, s, cam_off, (vH, vW) = _scale_to_fit_and_blur_pad(
+                frame.unsqueeze(0), Ht, Wt, mode="bilinear"
+            )
             frame = frame_4d.squeeze(0)
             valid = torch.zeros((1, Ht, Wt), dtype=torch.uint8)
             valid[:, cam_off[1]:cam_off[1] + vH, cam_off[0]:cam_off[0] + vW] = 1
             if mask is not None:
-                mask = _scale_to_fit_and_blur_pad(mask.unsqueeze(0), Ht, Wt, "nearest")[0].squeeze(0)
+                mask = _scale_to_fit_and_zero_pad(mask.unsqueeze(0), Ht, Wt, "nearest")[0].squeeze(0)
 
             ang = 0.0
             if geometric and cfg.rotate_p > 0 and torch.rand(()).item() < cfg.rotate_p:
@@ -248,18 +263,45 @@ def _sample_recrop_hw(H, W, scale_range, ratio_range, min_size=32, num_tries=10)
     h = w = max(min_size, int(round(min(H, W) * 0.9)))
     return (H - h) // 2, (W - w) // 2, (H - h) // 2 + h, (W - w) // 2 + w
 
-
-def _scale_to_fit_and_blur_pad(x, Ht, Wt, mode="bilinear", bg_down=16):
-    """Resize to fit inside (Ht,Wt) keeping aspect ratio; fill the border with
-    a heavily downsampled copy of the image instead of a flat color, so the
-    model never sees hard black padding edges."""
+def _scale_to_fit_and_zero_pad(x, Ht, Wt, mode):
     N, C, H, W = x.shape
     s = min(Ht / H, Wt / W)
     Hr, Wr = int(round(H * s)), int(round(W * s))
-    align_corners = False if mode == "bilinear" else None
-    x_fit = torch.nn.functional.interpolate(x, size=(Hr, Wr), mode=mode, align_corners=align_corners)
-    x_small = torch.nn.functional.interpolate(x, size=(max(1, Ht // bg_down), max(1, Wt // bg_down)), mode="area")
-    x_bg = torch.nn.functional.interpolate(x_small, size=(Ht, Wt), mode=mode, align_corners=align_corners)
+    ac = False if mode == "bilinear" else None
+    x_fit = torch.nn.functional.interpolate(x, size=(Hr, Wr), mode=mode, align_corners=ac)
+    out = torch.zeros(N, C, Ht, Wt, device=x.device, dtype=x.dtype)
+    pt, pl = (Ht - Hr) // 2, (Wt - Wr) // 2
+    out[:, :, pt:pt + Hr, pl:pl + Wr] = x_fit
+    return out, s, (pl, pt), (Hr, Wr)
+
+def _scale_to_fit_and_mean_pad(x, Ht, Wt, mode, fill):
+    """Resize to fit inside (Ht,Wt) keeping aspect ratio; fill the border with
+    a flat mean color instead of black, so the model doesn't see hard zero
+    edges and (unlike blur-pad) no object content leaks into the border."""
+    N, C, H, W = x.shape
+    s = min(Ht / H, Wt / W)
+    Hr, Wr = int(round(H * s)), int(round(W * s))
+    ac = False if mode == "bilinear" else None
+    x_fit = torch.nn.functional.interpolate(x, size=(Hr, Wr), mode=mode, align_corners=ac)
+    fill_t = torch.tensor(fill, device=x.device, dtype=x.dtype).view(1, C, 1, 1)
+    out = fill_t.expand(N, C, Ht, Wt).clone()
+    pt, pl = (Ht - Hr) // 2, (Wt - Wr) // 2
+    out[:, :, pt:pt + Hr, pl:pl + Wr] = x_fit
+    return out, s, (pl, pt), (Hr, Wr)
+
+def _scale_to_fit_and_blur_pad(x, Ht, Wt, mode="bilinear", bg_down: int = 16):
+    N, C, H, W = x.shape
+    s = min(Ht / H, Wt / W)
+    Hr, Wr = int(round(H * s)), int(round(W * s))
+    ac = False if mode == "bilinear" else None
+    x_fit = torch.nn.functional.interpolate(x, size=(Hr, Wr), mode=mode, align_corners=ac)
+    # Blurry background approximated by hard area-downsample then upsample.
+    # Constant cost (independent of input size) and visually equivalent to a
+    # wide-sigma gaussian for the purpose of hiding hard pad edges.
+    Hs = max(1, Ht // bg_down)
+    Ws = max(1, Wt // bg_down)
+    x_small = torch.nn.functional.interpolate(x, size=(Hs, Ws), mode="area")
+    x_bg = torch.nn.functional.interpolate(x_small, size=(Ht, Wt), mode=mode, align_corners=ac)
     pt, pl = (Ht - Hr) // 2, (Wt - Wr) // 2
     x_bg[:, :, pt:pt + Hr, pl:pl + Wr] = x_fit
     return x_bg, s, (pl, pt), (Hr, Wr)
